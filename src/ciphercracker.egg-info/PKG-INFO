@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: ciphercracker
+Version: 0.1.0
+Summary: CipherCracker CLI: classical cipher tools + cryptanalysis helpers
+Requires-Python: >=3.10
+Requires-Dist: typer>=0.12

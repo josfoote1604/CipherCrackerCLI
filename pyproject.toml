@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ciphercracker"
+version = "0.1.0"
+description = "CipherCracker CLI: classical cipher tools + cryptanalysis helpers"
+requires-python = ">=3.10"
+dependencies = ["typer>=0.12"]
+
+[project.scripts]
+ciphercracker = "ciphercracker.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"ciphercracker.data" = ["*.txt"]
