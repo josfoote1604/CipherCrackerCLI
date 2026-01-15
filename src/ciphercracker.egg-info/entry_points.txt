@@ -1,0 +1,2 @@
+[console_scripts]
+ciphercracker = ciphercracker.cli:main
