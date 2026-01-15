@@ -1,7 +1,13 @@
+# NOTICE
+
+- WORK IN PROGRESS: Last updated 01/14/2026. 
+- This project is a homelab project and is not intended for production use. 
+- This project has used AI/Coding Agents to help with the development process.
+
 # CipherCracker CLI
 
-WORK IN PROGRESS: Last updated 01/13/2026
-CipherCracker CLI is a set of classical cipher tools and cryptanalysis helpers. It allows you to analyze ciphertext, decrypt using known keys, and crack unknown ciphers using various techniques like frequency analysis and simulated annealing.
+- CipherCracker CLI is a set of classical cipher tools and cryptanalysis helpers. It allows you to analyze ciphertext, decrypt using known keys, and crack unknown ciphers using various techniques like frequency analysis and simulated annealing.
+- CipherCracker CLI can be very 'resource intensive' and may take up to several minutes to crack a cipher. Higher end hardware may be required for optimal performance.
 
 ## Overview
 
@@ -76,15 +82,7 @@ src/ciphercracker/
 └── cli.py              # CLI entry point and commands
 ```
 
-## Environment Variables
-
-- TODO: Document any environment variables used by the system (none currently identified).
-
 ## Tests
 
 - TODO: Automated tests are not yet fully implemented/configured. 
 - You can run any manual test scripts if present in the `tests` directory (none currently identified in the root).
-
-## License
-
-- TODO: Specify license (e.g., MIT, Apache-2.0).

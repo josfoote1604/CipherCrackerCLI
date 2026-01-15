@@ -1,9 +1,11 @@
+README.md
 pyproject.toml
 src/ciphercracker/__init__.py
 src/ciphercracker/cli.py
 src/ciphercracker.egg-info/PKG-INFO
 src/ciphercracker.egg-info/SOURCES.txt
 src/ciphercracker.egg-info/dependency_links.txt
+src/ciphercracker.egg-info/entry_points.txt
 src/ciphercracker.egg-info/requires.txt
 src/ciphercracker.egg-info/top_level.txt
 src/ciphercracker/classical/__init__.py
@@ -14,6 +16,7 @@ src/ciphercracker/classical/monoalphabetic/atbash.py
 src/ciphercracker/classical/monoalphabetic/caesar.py
 src/ciphercracker/classical/monoalphabetic/substitution.py
 src/ciphercracker/classical/polyalphabetic/__init__.py
+src/ciphercracker/classical/polyalphabetic/gating.py
 src/ciphercracker/classical/polyalphabetic/periodic_substitution.py
 src/ciphercracker/classical/polyalphabetic/vigenere.py
 src/ciphercracker/core/__init__.py
@@ -24,4 +27,5 @@ src/ciphercracker/core/results.py
 src/ciphercracker/core/scoring.py
 src/ciphercracker/core/utils.py
 src/ciphercracker/data/__init__.py
+src/ciphercracker/data/common_words_20k.txt
 src/ciphercracker/data/english_quadgrams.txt

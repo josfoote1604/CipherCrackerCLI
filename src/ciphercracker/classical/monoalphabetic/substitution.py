@@ -4,7 +4,8 @@ import math
 import random
 import re
 import time
-from typing import Optional
+from importlib import resources
+from typing import Optional, Tuple
 
 from ciphercracker.core.features import analyze_text
 from ciphercracker.core.registry import register_plugin
@@ -15,33 +16,115 @@ from ciphercracker.core.scoring import (
     english_likeness_score,
     word_bonus as core_word_bonus,
 )
+from ciphercracker.core.utils import normalize_az
 from ciphercracker.classical.common import parse_substitution_key, ALPHABET
 
 _ENGLISH_FREQ_ORDER = "ETAOINSHRDLCUMWFGYPBVKJXQZ"
+_WORD_RE = re.compile(r"[A-Z]+")
+
+# ----------------------------
+# 20k dictionary (ranked list)
+# ----------------------------
+
+_DICT_READY = False
+_WORD_SCORE: dict[str, float] = {}
+_MAX_WORD_LEN = 20
 
 
-# Extra word guidance (bigger than core.scoring._COMMON_WORDS)
-# These are very common and/or show up in your crypto/homework-style plaintexts.
-_EXTRA_WORDS = {
-    "THE", "AND", "TO", "OF", "IN", "IS", "IT", "YOU", "THAT", "A", "I", "FOR", "ON",
-    "WITH", "AS", "ARE", "THIS", "BE", "WAS", "HAVE", "NOT", "OR", "AT", "BY",
-    "FROM", "ONE", "ALL", "WE", "THEY", "HAS", "CAN", "WILL", "DO", "IF", "AN",
-    "WHEN", "RUN", "CODE", "MESSAGE", "SOMETHING", "RIGHT", "WRONG", "DOING",
-    "THEN", "VERIFY", "PLEASE", "SUBMIT", "EMAIL", "REPORT", "DESCRIBE",
-    "DIFFERENT", "MONOALPHABETIC", "CIPHERS", "USED", "ENCRYPTION", "COURSE",
-    "CRYPTOGRAPHY", "ASSIGNMENT", "FIRST",
-}
+def _ensure_dictionary_loaded() -> None:
+    """
+    Load ciphercracker.data/common_words_20k.txt (1 word per line, most common first).
+    Build a rank-based reward:
+        score(word) = log((N+1)/(rank+1))
+    """
+    global _DICT_READY, _WORD_SCORE
+    if _DICT_READY:
+        return
 
-# "Anchor" words that should be *very* compelling on short ciphertexts.
-# Exact word hits only. Bounded so it can't swamp quadgrams on longer texts.
-_CRIB_WORDS = {
-    "WHEN", "YOU", "RUN", "CODE", "THIS", "MESSAGE",
-    "SOMETHING", "RIGHT", "WRONG", "DOING",
-}
+    words: list[str] = []
+    try:
+        txt = resources.files("ciphercracker.data").joinpath("common_words_20k.txt").read_text(encoding="utf-8")
+        for ln in txt.splitlines():
+            w = ln.strip().upper()
+            if not w or w.startswith("#"):
+                continue
+            if w.isalpha():
+                words.append(w)
+    except Exception:
+        # Minimal fallback so solver still runs if packaging is wrong
+        words = ["THE", "AND", "TO", "OF", "IN", "IS", "YOU", "THAT", "FOR", "WITH", "THIS", "RIGHT", "WRONG"]
+
+    n = max(1, len(words))
+    for rank, w in enumerate(words):
+        _WORD_SCORE[w] = math.log((n + 1.0) / (rank + 1.0))
+
+    _DICT_READY = True
 
 
-_WORD_RE = re.compile(r"[A-Z]{2,}")
+def _extract_letter_tokens(text: str) -> list[str]:
+    return _WORD_RE.findall(text.upper())
 
+
+def _wordbreak_score_token(token: str) -> float:
+    """
+    Word-break DP score for one token.
+    Used ONLY as a tie-breaker near the end, never as the main objective.
+    """
+    _ensure_dictionary_loaded()
+
+    L = len(token)
+    if L == 0:
+        return 0.0
+
+    # Tuned to avoid making "random gibberish segmentation" attractive
+    unk_char_pen = -2.8
+    boundary_pen = -1.1
+
+    dp = [-1e18] * (L + 1)
+    dp[0] = 0.0
+
+    for i in range(1, L + 1):
+        # consume one unknown character
+        dp[i] = dp[i - 1] + unk_char_pen
+
+        j0 = max(0, i - _MAX_WORD_LEN)
+        for j in range(j0, i):
+            w = token[j:i]
+            s = _WORD_SCORE.get(w)
+            if s is None:
+                continue
+            cand = dp[j] + s + boundary_pen
+            if cand > dp[i]:
+                dp[i] = cand
+
+    return dp[L]
+
+
+def _wordbreak_score_text(fulltext: str) -> float:
+    """
+    Aggregate wordbreak score across tokens.
+    Tie-break only. We clamp it so it can't explode.
+    """
+    tokens = _extract_letter_tokens(fulltext)
+    if not tokens:
+        return 0.0
+
+    raw = 0.0
+    for t in tokens:
+        if 4 <= len(t) <= 28:
+            raw += _wordbreak_score_token(t)
+
+    # Clamp tie-break magnitude hard
+    if raw > 300.0:
+        raw = 300.0
+    if raw < -300.0:
+        raw = -300.0
+    return raw
+
+
+# ----------------------------
+# Core substitution helpers
+# ----------------------------
 
 def _should_try(text: str) -> bool:
     feats = analyze_text(text)
@@ -72,11 +155,6 @@ def _random_mapping(rng: random.Random) -> list[str]:
 
 
 def _letters_meta(text: str) -> tuple[list[tuple[int, int]], list[int], list[bool]]:
-    """
-    letters_meta: list of (alpha_idx, cipher_idx) for each A-Z letter in text (uppercased)
-    positions: original positions in ciphertext for each letter
-    cases: True if original letter was uppercase, else lowercase
-    """
     letters_meta: list[tuple[int, int]] = []
     positions: list[int] = []
     cases: list[bool] = []
@@ -93,10 +171,6 @@ def _letters_meta(text: str) -> tuple[list[tuple[int, int]], list[int], list[boo
 
 
 def _build_occ(letters_meta: list[tuple[int, int]]) -> list[list[int]]:
-    """
-    occ[cidx] = indices into letters_meta where cipher letter cidx occurs.
-    (These indices are positions into the letters-only plaintext array.)
-    """
     occ: list[list[int]] = [[] for _ in range(26)]
     for idx, (_, cidx) in enumerate(letters_meta):
         occ[cidx].append(idx)
@@ -104,10 +178,7 @@ def _build_occ(letters_meta: list[tuple[int, int]]) -> list[list[int]]:
 
 
 def _decrypt_letters_only(letters_meta: list[tuple[int, int]], mapping: list[str]) -> list[str]:
-    out: list[str] = []
-    for _, cidx in letters_meta:
-        out.append(mapping[cidx])
-    return out
+    return [mapping[cidx] for (_, cidx) in letters_meta]
 
 
 def _apply_to_fulltext(
@@ -124,106 +195,168 @@ def _apply_to_fulltext(
     return out
 
 
-def _update_full_for_cipher_letter(
+# ----------------------------
+# Objective: base + tie-break
+# ----------------------------
+
+def _objective_components(
     ciphertext: str,
-    out_chars: list[str],
-    positions: list[int],
-    cases: list[bool],
-    letters_meta: list[tuple[int, int]],
+    letters_meta,
+    positions,
+    cases,
     mapping: list[str],
-    occ: list[list[int]],
-    cidx: int,
-) -> None:
+    *,
+    use_dict_tiebreak: bool,
+) -> Tuple[float, float]:
     """
-    Update full plaintext chars for occurrences of cipher letter cidx.
+    Returns (base, tie):
+      base: MUST dominate. (quadgrams + core word bonus)
+      tie : dictionary wordbreak, ONLY to break ties between near-equal base scores.
+
+    We compare lexicographically: higher base wins; if base ties (within eps),
+    higher tie wins.
     """
-    plain_up = mapping[cidx]
-    for meta_idx in occ[cidx]:
-        pos = positions[meta_idx]
-        out_chars[pos] = plain_up if cases[meta_idx] else plain_up.lower()
+    pt_full = "".join(_apply_to_fulltext(ciphertext, positions, cases, mapping, letters_meta))
 
-
-def _extract_words_upper(text: str) -> list[str]:
-    return _WORD_RE.findall(text.upper())
-
-
-def _extra_word_bonus(fulltext: str, *, n_letters: int) -> float:
-    """
-    Additional bounded word guidance using a larger word set.
-    Scales up on short ciphertexts.
-    """
-    words = _extract_words_upper(fulltext)
-    if not words:
-        return 0.0
-
-    hits = sum(1 for w in words if w in _EXTRA_WORDS)
-    misses = len(words) - hits
-
-    bonus = 3.0 * hits - 0.25 * misses
-
-    # Scale up a bit on short texts
-    if n_letters < 120:
-        bonus *= 2.0
-    elif n_letters < 200:
-        bonus *= 1.4
-
-    # Bound so quadgrams still dominate globally
-    if bonus > 80.0:
-        bonus = 80.0
-    if bonus < -30.0:
-        bonus = -30.0
-    return bonus
-
-
-def _crib_bonus(fulltext: str, *, n_letters: int) -> float:
-    """
-    Strong but bounded bonus for exact anchor-word hits.
-    This is what pushes YHEN->WHEN, CAR->YOU type near-misses over the line on short inputs.
-    """
-    words = _extract_words_upper(fulltext)
-    if not words:
-        return 0.0
-
-    hits = sum(1 for w in words if w in _CRIB_WORDS)
-
-    # More weight when short; taper when longer
-    if n_letters < 120:
-        per_hit = 35.0
-        cap = 220.0
-    elif n_letters < 220:
-        per_hit = 22.0
-        cap = 160.0
+    if get_quadgram_scorer() is not None:
+        base = quadgram_score(normalize_az(pt_full)) + core_word_bonus(pt_full)
     else:
-        per_hit = 10.0
-        cap = 90.0
+        # fallback (rare for you)
+        base = english_likeness_score(pt_full) * 10.0
 
-    bonus = hits * per_hit
-    if bonus > cap:
-        bonus = cap
-    return bonus
+    tie = 0.0
+    if use_dict_tiebreak:
+        tie = _wordbreak_score_text(pt_full)
 
+    return base, tie
+
+
+def _better(a: Tuple[float, float], b: Tuple[float, float], *, eps: float = 1e-6) -> bool:
+    """
+    True if a is better than b under lexicographic compare with epsilon on base.
+    """
+    if a[0] > b[0] + eps:
+        return True
+    if b[0] > a[0] + eps:
+        return False
+    return a[1] > b[1] + eps
+
+
+# ----------------------------
+# k-opt polish (swap + 3-cycles) with SAFE restore
+# ----------------------------
+
+def _kopt_polish(
+    ciphertext: str,
+    letters_meta,
+    positions,
+    cases,
+    base_map: list[str],
+    *,
+    time_up_fn,
+    max_moves: int,
+    scan_3cycles: bool = True,
+    use_dict_tiebreak: bool = True,
+) -> list[str]:
+    """
+    Steepest-ascent polish using:
+      - best improving SWAP
+      - best improving 3-CYCLE (both directions)
+    Safe restore: always put mapping back exactly after evaluation.
+    """
+    m = base_map[:]
+    cur = _objective_components(ciphertext, letters_meta, positions, cases, m, use_dict_tiebreak=use_dict_tiebreak)
+
+    moves = 0
+    while moves < max_moves and not time_up_fn():
+        best_val = cur
+        best_move = None  # ("swap", i, j) or ("cyc", i, j, k, dir)
+
+        # swaps
+        for i in range(26):
+            if time_up_fn():
+                break
+            for j in range(i + 1, 26):
+                m[i], m[j] = m[j], m[i]
+                v = _objective_components(ciphertext, letters_meta, positions, cases, m, use_dict_tiebreak=use_dict_tiebreak)
+                m[i], m[j] = m[j], m[i]
+
+                if _better(v, best_val):
+                    best_val = v
+                    best_move = ("swap", i, j)
+
+        # 3-cycles
+        if scan_3cycles and not time_up_fn():
+            for i in range(24):
+                if time_up_fn():
+                    break
+                for j in range(i + 1, 25):
+                    for k in range(j + 1, 26):
+                        a, b, c = m[i], m[j], m[k]
+
+                        # dir 0: i<-j, j<-k, k<-i
+                        m[i], m[j], m[k] = b, c, a
+                        v0 = _objective_components(ciphertext, letters_meta, positions, cases, m, use_dict_tiebreak=use_dict_tiebreak)
+                        m[i], m[j], m[k] = a, b, c  # restore
+
+                        if _better(v0, best_val):
+                            best_val = v0
+                            best_move = ("cyc", i, j, k, 0)
+
+                        # dir 1: i<-k, k<-j, j<-i
+                        m[i], m[j], m[k] = c, a, b
+                        v1 = _objective_components(ciphertext, letters_meta, positions, cases, m, use_dict_tiebreak=use_dict_tiebreak)
+                        m[i], m[j], m[k] = a, b, c  # restore
+
+                        if _better(v1, best_val):
+                            best_val = v1
+                            best_move = ("cyc", i, j, k, 1)
+
+        if best_move is None or not _better(best_val, cur):
+            break
+
+        # apply best move
+        if best_move[0] == "swap":
+            _, i, j = best_move
+            m[i], m[j] = m[j], m[i]
+        else:
+            _, i, j, k, d = best_move
+            a, b, c = m[i], m[j], m[k]
+            if d == 0:
+                m[i], m[j], m[k] = b, c, a
+            else:
+                m[i], m[j], m[k] = c, a, b
+
+        cur = best_val
+        moves += 1
+
+    return m
+
+
+# ----------------------------
+# Cracker
+# ----------------------------
 
 def crack_substitution_anneal(
     ciphertext: str,
     *,
-    restarts: int = 40,
-    steps: int = 35000,
-    temp_start: float = 20.0,
-    temp_end: float = 0.2,
+    restarts: int = 24,
+    steps: int = 21000,
+    temp_start: float = 18.0,
+    temp_end: float = 0.25,
     seed: int | None = None,
-    max_seconds: float | None = None,
-    full_score_every: int = 150,
+    max_seconds: float | None = 30.0,
+    full_score_every: int = 260,
 ) -> list[tuple[float, list[str], str]]:
     """
-    Two-tier scoring:
-      - accept moves by FAST quadgram score on letters-only plaintext
-      - track best by FULL score = quadgram(letters-only) + word bonuses (core + extra + crib)
+    General-purpose monoalphabetic substitution solver.
 
-    Then steepest-ascent polish using the FULL score.
+    Acceptance: fast quadgrams on letters-only plaintext.
+    Best tracking: base objective = quadgrams(fulltext normalized) + core word bonus.
+    Final polish: swap + 3-cycle steepest-ascent, with dictionary used ONLY as tie-break.
     """
     start = time.perf_counter()
     rng = random.Random(seed)
-    use_quad = get_quadgram_scorer() is not None
 
     letters_meta, positions, cases = _letters_meta(ciphertext)
     n_letters = len(letters_meta)
@@ -235,23 +368,18 @@ def crack_substitution_anneal(
     def time_up() -> bool:
         return max_seconds is not None and (time.perf_counter() - start) >= max_seconds
 
+    use_quad = get_quadgram_scorer() is not None
+
     def fast_score(pt_letters: list[str]) -> float:
         if use_quad:
-            return quadgram_score("".join(pt_letters))  # already A-Z
-        # fallback (weaker)
+            return quadgram_score("".join(pt_letters))
         return english_likeness_score("".join(pt_letters)) * 10.0
 
-    def full_score(pt_letters: list[str], pt_full_chars: list[str]) -> float:
-        fulltext = "".join(pt_full_chars)
+    def base_score_from_map(m: list[str]) -> float:
+        pt_full = "".join(_apply_to_fulltext(ciphertext, positions, cases, m, letters_meta))
         if use_quad:
-            base = quadgram_score("".join(pt_letters))
-            return (
-                base
-                + core_word_bonus(fulltext)
-                + _extra_word_bonus(fulltext, n_letters=n_letters)
-                + _crib_bonus(fulltext, n_letters=n_letters)
-            )
-        return english_likeness_score(fulltext) * 10.0
+            return quadgram_score(normalize_az(pt_full)) + core_word_bonus(pt_full)
+        return english_likeness_score(pt_full) * 10.0
 
     best_across: list[tuple[float, list[str], str]] = []
 
@@ -259,10 +387,10 @@ def crack_substitution_anneal(
         if time_up():
             break
 
-        # Init strategy: several freq-based (perturbed) then random
-        if r < 10:
+        # init
+        if r < 7:
             mapping = _initial_mapping_freq(ciphertext)
-            swaps = 10 + 14 * r
+            swaps = 12 + 16 * r
             for _ in range(swaps):
                 i, j = rng.randrange(26), rng.randrange(26)
                 if i != j:
@@ -271,15 +399,10 @@ def crack_substitution_anneal(
             mapping = _random_mapping(rng)
 
         pt_letters = _decrypt_letters_only(letters_meta, mapping)
-        pt_full_chars = _apply_to_fulltext(ciphertext, positions, cases, mapping, letters_meta)
-
         cur_fast = fast_score(pt_letters)
-        cur_full = full_score(pt_letters, pt_full_chars)
 
         best_map = mapping[:]
-        best_letters = pt_letters[:]
-        best_full_chars = pt_full_chars[:]
-        best_full = cur_full
+        best_base = base_score_from_map(best_map)
 
         for step in range(steps):
             if time_up():
@@ -291,10 +414,8 @@ def crack_substitution_anneal(
             if i == j:
                 continue
 
-            # swap plaintext assignments for cipher letters i and j
             mapping[i], mapping[j] = mapping[j], mapping[i]
 
-            # update letters-only plaintext (incremental)
             for idx in occ[i]:
                 pt_letters[idx] = mapping[i]
             for idx in occ[j]:
@@ -310,105 +431,46 @@ def crack_substitution_anneal(
 
             if accept:
                 cur_fast = new_fast
-
-                # update full plaintext incrementally only when accepted
-                _update_full_for_cipher_letter(ciphertext, pt_full_chars, positions, cases, letters_meta, mapping, occ, i)
-                _update_full_for_cipher_letter(ciphertext, pt_full_chars, positions, cases, letters_meta, mapping, occ, j)
-
-                if step % full_score_every == 0:
-                    cur_full = full_score(pt_letters, pt_full_chars)
-                    if cur_full > best_full:
-                        best_full = cur_full
+                if (step % full_score_every) == 0:
+                    b = base_score_from_map(mapping)
+                    if b > best_base:
+                        best_base = b
                         best_map = mapping[:]
-                        best_letters = pt_letters[:]
-                        best_full_chars = pt_full_chars[:]
             else:
-                # revert swap
+                # revert
                 mapping[i], mapping[j] = mapping[j], mapping[i]
                 for idx in occ[i]:
                     pt_letters[idx] = mapping[i]
                 for idx in occ[j]:
                     pt_letters[idx] = mapping[j]
 
-        # End-of-restart full check
-        cur_full = full_score(pt_letters, pt_full_chars)
-        if cur_full > best_full:
-            best_full = cur_full
+        # end-of-restart check
+        b = base_score_from_map(mapping)
+        if b > best_base:
+            best_base = b
             best_map = mapping[:]
-            best_letters = pt_letters[:]
-            best_full_chars = pt_full_chars[:]
 
-        # --- Steepest-ascent polish on FULL score ---
-        def polish(
-            m: list[str],
-            letters: list[str],
-            full_chars: list[str],
-            best_s: float,
-        ) -> tuple[float, list[str], list[str], list[str]]:
-            max_passes = 6
-            for _ in range(max_passes):
-                if time_up():
-                    break
+        # polish: only if quadgrams available
+        if use_quad and not time_up():
+            # short texts: allow a few moves; still fast at 162 chars
+            max_moves = 10 if n_letters < 240 else 7
 
-                improved = False
-                best_pair: Optional[tuple[int, int]] = None
-                best_pair_score = best_s
+            # Use dict tie-break only in polish, never in anneal
+            best_map = _kopt_polish(
+                ciphertext,
+                letters_meta,
+                positions,
+                cases,
+                best_map,
+                time_up_fn=time_up,
+                max_moves=max_moves,
+                scan_3cycles=True,
+                use_dict_tiebreak=True,
+            )
+            best_base = base_score_from_map(best_map)
 
-                # try all swaps; keep the best this pass
-                for i in range(26):
-                    for j in range(i + 1, 26):
-                        if time_up():
-                            break
-
-                        m[i], m[j] = m[j], m[i]
-
-                        for idx in occ[i]:
-                            letters[idx] = m[i]
-                        for idx in occ[j]:
-                            letters[idx] = m[j]
-
-                        _update_full_for_cipher_letter(ciphertext, full_chars, positions, cases, letters_meta, m, occ, i)
-                        _update_full_for_cipher_letter(ciphertext, full_chars, positions, cases, letters_meta, m, occ, j)
-
-                        s = full_score(letters, full_chars)
-                        if s > best_pair_score:
-                            best_pair_score = s
-                            best_pair = (i, j)
-                            improved = True
-
-                        # revert
-                        m[i], m[j] = m[j], m[i]
-                        for idx in occ[i]:
-                            letters[idx] = m[i]
-                        for idx in occ[j]:
-                            letters[idx] = m[j]
-                        _update_full_for_cipher_letter(ciphertext, full_chars, positions, cases, letters_meta, m, occ, i)
-                        _update_full_for_cipher_letter(ciphertext, full_chars, positions, cases, letters_meta, m, occ, j)
-
-                    if time_up():
-                        break
-
-                if not improved or best_pair is None:
-                    break
-
-                i, j = best_pair
-                m[i], m[j] = m[j], m[i]
-                for idx in occ[i]:
-                    letters[idx] = m[i]
-                for idx in occ[j]:
-                    letters[idx] = m[j]
-                _update_full_for_cipher_letter(ciphertext, full_chars, positions, cases, letters_meta, m, occ, i)
-                _update_full_for_cipher_letter(ciphertext, full_chars, positions, cases, letters_meta, m, occ, j)
-
-                best_s = best_pair_score
-
-            return best_s, m, letters, full_chars
-
-        best_full, best_map, best_letters, best_full_chars = polish(
-            best_map, best_letters, best_full_chars, best_full
-        )
-
-        best_across.append((best_full, best_map[:], "".join(best_full_chars)))
+        final_full = "".join(_apply_to_fulltext(ciphertext, positions, cases, best_map, letters_meta))
+        best_across.append((best_base, best_map[:], final_full))
 
     best_across.sort(key=lambda x: x[0], reverse=True)
     return best_across[:5]
@@ -435,7 +497,17 @@ class SubstitutionCipher:
         return "".join(out)
 
     def crack(self, ciphertext: str) -> list[SolveResult]:
-        found = crack_substitution_anneal(ciphertext)
+        az_len = len(normalize_az(ciphertext))
+        max_seconds = 28.0 if az_len < 220 else 42.0
+
+        found = crack_substitution_anneal(
+            ciphertext,
+            restarts=24 if az_len < 260 else 30,
+            steps=21000 if az_len < 260 else 26000,
+            max_seconds=max_seconds,
+            full_score_every=260 if az_len < 260 else 320,
+        )
+
         results: list[SolveResult] = []
         for s, mapping, pt in found:
             results.append(
@@ -444,8 +516,8 @@ class SubstitutionCipher:
                     plaintext=pt,
                     key=_mapping_to_keystring(mapping),
                     score=float(s),
-                    confidence=0.0,  # registry will recompute confidence
-                    notes="Simulated annealing mono-sub (fast quadgram accept + full-score tracking + anchor-word polish)",
+                    confidence=0.0,  # registry recomputes confidence
+                    notes="Simulated annealing mono-sub (quadgram-driven + safe k-opt polish (swap+3cycle) + dict tie-break only)",
                     meta={"fitness": "quadgram" if get_quadgram_scorer() else "fallback"},
                 )
             )
