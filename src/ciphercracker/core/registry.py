@@ -5,8 +5,15 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Protocol
 
 from .results import SolveResult
-from .scoring import english_likeness_score, get_quadgram_scorer, quadgram_score, plaintext_fitness
+from .scoring import (
+    english_likeness_score,
+    get_quadgram_scorer,
+    quadgram_score,
+    plaintext_fitness,
+    gibberish_probability,
+)
 from ciphercracker.core.utils import normalize_az
+
 
 def _cipher_preference(cipher_name: str, key: str | None) -> int:
     """
@@ -72,6 +79,7 @@ def _dedupe_by_plaintext(results: list[SolveResult]) -> list[SolveResult]:
 def _sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
 
+
 def rank_score(text: str) -> float:
     """
     Use quadgram+word bonus when available, else fallback.
@@ -81,25 +89,43 @@ def rank_score(text: str) -> float:
     return english_likeness_score(text)
 
 
+def _length_confidence_scale(n_letters: int) -> float:
+    """
+    Downscale confidence for short texts where n-gram scoring is noisy.
+    Keeps short-text results from looking falsely "certain".
+    """
+    scale = n_letters / 180.0
+    if scale < 0.25:
+        scale = 0.25
+    if scale > 1.0:
+        scale = 1.0
+    return scale
+
 
 def confidence_from_score(text: str, score: float) -> float:
     """
     Confidence heuristic:
     - In quadgram mode, use average log10 prob per quadgram (score / (n-3)).
-      English plaintext tends to have a noticeably better (less negative) average than gibberish.
-    - In fallback mode, keep the old scaling.
+    - Apply a length-based downscale so short texts don't appear overly confident.
+    - In fallback mode, keep old scaling (also length-scaled lightly).
     """
+    n_letters = len(normalize_az(text))
+    length_scale = _length_confidence_scale(n_letters)
+
     if get_quadgram_scorer() is not None:
         t = normalize_az(text)
         q = max(1, len(t) - 3)
         avg = score / q  # log10 prob per quadgram (negative)
 
-        # Map avg roughly into 0..1. Tune as needed.
-        # Typical: English maybe around -3.x to -4.x; gibberish worse (more negative).
-        conf = _sigmoid(4.0 * (avg + 4.6))   # tune 4.6 and slope 4.0  # avg=-6 -> 0, avg=-3 -> 1
+        conf = _sigmoid(4.0 * (avg + 4.6))  # tune 4.6 and slope 4.0
+        conf = max(0.0, min(1.0, conf))
+        conf *= length_scale
         return max(0.0, min(1.0, conf))
 
-    return min(1.0, max(0.0, score / 100.0))
+    conf = min(1.0, max(0.0, score / 100.0))
+    conf *= length_scale
+    return max(0.0, min(1.0, conf))
+
 
 def confidence_score(text: str) -> float:
     """
@@ -110,6 +136,7 @@ def confidence_score(text: str) -> float:
     if get_quadgram_scorer() is not None:
         return quadgram_score(normalize_az(text))
     return english_likeness_score(text)
+
 
 class CipherPlugin(Protocol):
     name: str
@@ -172,6 +199,8 @@ def crack_unknown(ciphertext: str, *, top_n: int = 10, include: set[str] | None 
     Rank results by:
       - plugin-provided meta['best_full'] when available
       - otherwise rank_score(plaintext)
+
+    If include is None (auto mode), prune obvious gibberish before returning.
     """
     results: list[SolveResult] = []
 
@@ -186,21 +215,16 @@ def crack_unknown(ciphertext: str, *, top_n: int = 10, include: set[str] | None 
         try:
             results.extend(entry.plugin.crack(ciphertext))
         except Exception:
-            # If user targeted a plugin, show the real crash instead of silently ignoring it
             if include is not None:
                 raise
             continue
 
     scored: list[SolveResult] = []
     for r in results:
-        # Prune ultra-low-confidence noise unless user explicitly targeted ciphers
-        if include is None:
-            scored = [x for x in scored if x.confidence >= 0.05]
-
         # use plugin score if provided (ranking/display)
         s = _score_from_result(r)
 
-        # BUT compute confidence from a "raw" score that matches the confidence model
+        # compute confidence from a "raw" score that matches the confidence model
         conf_score = confidence_score(r.plaintext)
         conf = confidence_from_score(r.plaintext, conf_score)
 
@@ -213,6 +237,10 @@ def crack_unknown(ciphertext: str, *, top_n: int = 10, include: set[str] | None 
             notes=r.notes,
             meta=r.meta,
         ))
+
+    # Auto-mode pruning: remove obvious gibberish / ultra-low confidence AFTER computing confidence
+    if include is None:
+        scored = [x for x in scored if x.confidence >= 0.05 and gibberish_probability(x.plaintext) <= 0.85]
 
     scored = _dedupe_by_plaintext(scored)
     scored.sort(key=lambda x: x.score, reverse=True)
