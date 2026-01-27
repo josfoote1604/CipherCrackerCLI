@@ -57,12 +57,36 @@ _ENGLISH_FREQ = {
     "Q": 0.0010, "Z": 0.0007,
 }
 
-# Small fallback list (good enough to start). You can later load a bigger file.
-_COMMON_WORDS = {
+# Small fallback list
+_COMMON_WORDS_FALLBACK = {
     "THE", "AND", "TO", "OF", "IN", "IS", "IT", "YOU", "THAT", "A", "I", "FOR", "ON",
     "WITH", "AS", "ARE", "THIS", "BE", "WAS", "HAVE", "NOT", "OR", "AT", "BY",
     "FROM", "ONE", "ALL", "WE", "THEY", "HAS", "CAN", "WILL", "DO", "IF", "AN",
 }
+
+# scoring.py (add near top)
+_COMMON_WORDS: set[str] | None = None
+
+def get_common_words() -> set[str]:
+    global _COMMON_WORDS
+    if _COMMON_WORDS is not None:
+        return _COMMON_WORDS
+
+    try:
+        # your file: ciphercracker/data/common_words_20k.txt
+        raw = resources.files("ciphercracker.data").joinpath("common_words_20k.txt").read_text(encoding="utf-8")
+        words = set()
+        for line in raw.splitlines():
+            w = line.strip().upper()
+            if w and w.isalpha():
+                words.add(w)
+        _COMMON_WORDS = words
+    except Exception:
+        # fallback to the tiny hardcoded set if packaging fails
+        _COMMON_WORDS = set(_COMMON_WORDS_FALLBACK)  # rename your current set to _COMMON_WORDS_FALLBACK
+
+    return _COMMON_WORDS
+
 
 _WORD_RE = re.compile(r"[A-Z]{2,}")
 
@@ -90,31 +114,22 @@ def word_hit_rate(text: str) -> float:
     words = _extract_words(text)
     if not words:
         return 0.0
-    hits = sum(1 for w in words if w in _COMMON_WORDS)
+    common = get_common_words()
+    hits = sum(1 for w in words if w in common)
     return hits / len(words)
 
 def word_bonus(text: str) -> float:
     """
-    Bounded bonus to push 'almost English' over the line.
-    Returns a small positive value for real-word hits, and a small penalty for lots of misses.
-    Designed to be added to quadgram_score (which is usually large negative).
+    Small POSITIVE-ONLY tie-breaker. Never penalize misses.
     """
     words = _extract_words(text)
     if not words:
         return 0.0
 
-    hits = sum(1 for w in words if w in _COMMON_WORDS)
-    misses = len(words) - hits
+    hr = word_hit_rate(text)  # 0..1
+    # Cap effect: 0..+8 (tiny compared to quadgrams, but useful for tie-break)
+    return min(8.0, 8.0 * hr)
 
-    # Tuned to be "helpful but not dominant"
-    bonus = 2.0 * hits - 0.5 * misses
-
-    # Bound the effect so it can't swamp quadgrams
-    if bonus > 20.0:
-        bonus = 20.0
-    if bonus < -10.0:
-        bonus = -10.0
-    return bonus
 
 def plaintext_fitness(text: str) -> float:
     """
@@ -178,3 +193,18 @@ def gibberish_probability(text: str) -> float:
     if s >= 15:
         return 0.70
     return 0.90
+
+def quadgram_score_per_char(text: str) -> float:
+    az = normalize_az(text)
+    if len(az) < 4:
+        return float("-inf")
+    q = quadgram_score(az)
+    return q / (len(az) - 3)
+
+def plaintext_fitness(text: str) -> float:
+    az = normalize_az(text)
+    # Use per-char quadgrams as the primary driver
+    q = quadgram_score(az)
+    denom = max(1, (len(az) - 3))
+    qn = q / denom
+    return qn * 1000.0 + word_bonus(text)  # 1000 just makes it “human scale”

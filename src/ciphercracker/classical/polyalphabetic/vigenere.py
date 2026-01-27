@@ -4,44 +4,9 @@ from collections import Counter
 
 from ciphercracker.core.registry import register_plugin
 from ciphercracker.core.results import SolveResult
-from ciphercracker.core.scoring import chi_squared_english
+from ciphercracker.core.scoring import chi_squared_english, plaintext_fitness
 from ciphercracker.classical.common import norm_key_alpha, shift_char, ALPHABET
-from .gating import should_try_vigenere
-
-from ciphercracker.core.features import analyze_text, ioc_scan
-from ciphercracker.core.utils import normalize_az
-
-def _has_periodicity_signal(ct: str, *, max_len: int, min_len: int, thresh: float) -> bool:
-    az = normalize_az(ct)
-    if len(az) < min_len:
-        return False
-
-    # Avoid wasting time on low-alpha / weird charsets
-    info = analyze_text(ct)
-    if info.get("alpha_ratio", 0.0) < 0.70:
-        return False
-
-    # Look for k>1 with elevated average IoC
-    top = ioc_scan(ct, max_len=max_len)[:8]
-    return any(k >= 2 and val >= thresh for k, val in top)
-
-
-# assuming your plugin class is named VigenerePlugin
-def register() -> None:
-    register_plugin(VigenereCipher(), should_try=should_try_vigenere)
-
-def _should_try(ct: str) -> bool:
-    az = normalize_az(ct)
-    if len(az) < 60:
-        return False
-
-    info = analyze_text(ct)
-    if info.get("alpha_ratio", 0.0) < 0.70:
-        return False
-
-    top = ioc_scan(ct, max_len=12)[:8]
-    return any(k >= 2 and val >= 0.072 for k, val in top)
-
+from ciphercracker.classical.polyalphabetic.gating import should_try_vigenere
 
 
 def _vigenere_decrypt(text: str, key: str) -> str:
@@ -57,8 +22,7 @@ def _vigenere_decrypt(text: str, key: str) -> str:
             up = ch.upper()
             if up in ALPHABET:
                 shift = shifts[j % len(shifts)]
-                # decrypt: shift backwards
-                plain = shift_char(up, -shift)
+                plain = shift_char(up, -shift)  # decrypt: shift backwards
                 out.append(plain if ch.isupper() else plain.lower())
                 j += 1
             else:
@@ -88,23 +52,6 @@ def _avg_ioc_for_keylen(az: str, keylen: int) -> float:
     return sum(iocs) / len(iocs) if iocs else 0.0
 
 
-def _best_shift_for_column(col: str) -> int:
-    """
-    Find Caesar shift that best 'decrypts' the column into English distribution.
-    For Vigenère, each column is Caesar-encrypted with some shift.
-    """
-    best_shift = 0
-    best_chi = float("inf")
-    for shift in range(26):
-        # decrypt column by shifting backward
-        dec = "".join(shift_char(ch, -shift) for ch in col)
-        chi = chi_squared_english(dec)
-        if chi < best_chi:
-            best_chi = chi
-            best_shift = shift
-    return best_shift
-
-
 class VigenereCipher:
     name = "vigenere"
 
@@ -112,17 +59,16 @@ class VigenereCipher:
         return _vigenere_decrypt(ciphertext, key)
 
     def crack(self, ciphertext: str) -> list[SolveResult]:
-        from ciphercracker.core.scoring import english_likeness_score
-
         az = _only_az(ciphertext)
         n = len(az)
-        if n < 30:
+        # Be a bit more permissive for short-but-usable samples
+        if n < 20:
             return []
 
         # --- key length candidates ---
         # Try more lengths, but avoid lengths that make columns too short.
         max_klen = min(24, max(2, n // 3))  # keep columns reasonably sized
-        lens = []
+        lens: list[tuple[float, float, int]] = []
         for klen in range(2, max_klen + 1):
             cols = [az[i::klen] for i in range(klen)]
             # Require each column to have at least 6 chars (tweakable)
@@ -137,67 +83,76 @@ class VigenereCipher:
             return []
 
         lens.sort(reverse=True)
-        top_lens = [klen for _, _, klen in lens[:6]]
+        # Evaluate more candidate key lengths (helps on shorter texts)
+        top_lens = [klen for _, _, klen in lens[:10]]
 
         results: list[SolveResult] = []
 
         # --- beam search settings ---
-        TOP_SHIFTS_PER_COL = 4  # try top 3-5
-        BEAM_WIDTH = 150  # keep best partial keys
-
-        def top_shifts_for_column(col: str, top_k: int) -> list[int]:
-            # rank shifts by chi-squared on that column
-            scored = []
-            for shift in range(26):
-                dec = "".join(shift_char(ch, -shift) for ch in col)
-                chi = chi_squared_english(dec)
-                scored.append((chi, shift))
-            scored.sort(key=lambda x: x[0])  # lower chi is better
-            return [s for _, s in scored[:top_k]]
+        TOP_SHIFTS_PER_COL = 4   # try top 3-5
+        BEAM_WIDTH = 250         # keep best partial keys; a bit wider is safer
 
         for klen in top_lens:
             cols = [az[i::klen] for i in range(klen)]
-            col_shift_options = [top_shifts_for_column(c, TOP_SHIFTS_PER_COL) for c in cols]
+
+            # Precompute chi-squared table per column/shift.
+            # This is the critical fix: score partial keys by column evidence,
+            # not by decrypting the entire text with an incomplete key.
+            chi_table: list[list[float]] = []
+            for c in cols:
+                row = []
+                for shift in range(26):
+                    dec = "".join(shift_char(ch, -shift) for ch in c)
+                    row.append(chi_squared_english(dec))
+                chi_table.append(row)
+
+            def top_shifts_for_column(col_idx: int, top_k: int) -> list[int]:
+                row = chi_table[col_idx]
+                ranked = sorted(range(26), key=lambda s: row[s])  # lower chi is better
+                return ranked[:top_k]
+
+            col_shift_options = [
+                top_shifts_for_column(i, TOP_SHIFTS_PER_COL) for i in range(klen)
+            ]
 
             # Beam holds tuples: (score, key_shifts_list)
+            # Higher is better => use negative chi-squared (lower chi -> higher score)
             beam: list[tuple[float, list[int]]] = [(0.0, [])]
 
             for col_idx in range(klen):
                 new_beam: list[tuple[float, list[int]]] = []
-                for _, partial in beam:
+                for score, partial in beam:
                     for shift in col_shift_options[col_idx]:
-                        candidate = partial + [shift]
-                        # Build partial key (A=0, B=1, ...)
-                        key = "".join(chr(ord("A") + s) for s in candidate)
-                        pt = _vigenere_decrypt(ciphertext, key)
+                        new_score = score - chi_table[col_idx][shift]
+                        new_beam.append((new_score, partial + [shift]))
 
-                        # Score using full plaintext (even partial key still decrypts every Nth letter correctly)
-                        s = english_likeness_score(pt)
-
-                        new_beam.append((s, candidate))
-
-                # Keep best partials
                 new_beam.sort(key=lambda x: x[0], reverse=True)
                 beam = new_beam[:BEAM_WIDTH]
 
-            # Evaluate final candidates from beam
-            for s, shifts in beam[:12]:  # take top few final keys
+            # Evaluate final candidates from beam using true plaintext fitness
+            # (quadgrams + small tie-breakers).
+            for _, shifts in beam[:40]:
                 key = "".join(chr(ord("A") + sh) for sh in shifts)
                 pt = _vigenere_decrypt(ciphertext, key)
+                fit = plaintext_fitness(pt)
+
                 results.append(
                     SolveResult(
                         cipher_name=self.name,
                         plaintext=pt,
                         key=key,
                         notes=f"Beam search keylen={klen}",
-                        meta={"key_length": klen},
+                        meta={"key_length": klen, "fitness": fit},
                     )
                 )
 
+        # Sort best-first so the CLI ranks these sensibly vs other ciphers too.
+        results.sort(key=lambda r: r.meta.get("fitness", float("-inf")), reverse=True)
         return results
 
     def fingerprint(self, ciphertext: str) -> dict:
         return {"family": "polyalphabetic"}
 
 
-register_plugin(VigenereCipher(), should_try=_should_try)
+# Single, consistent plugin registration (avoid duplicate registrations)
+register_plugin(VigenereCipher(), should_try=should_try_vigenere)

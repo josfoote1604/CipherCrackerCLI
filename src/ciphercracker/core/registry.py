@@ -200,7 +200,8 @@ def crack_unknown(ciphertext: str, *, top_n: int = 10, include: set[str] | None 
       - plugin-provided meta['best_full'] when available
       - otherwise rank_score(plaintext)
 
-    If include is None (auto mode), prune obvious gibberish before returning.
+    If include is None (auto mode), prune obvious noise, but never prune to empty
+    if we actually produced candidates.
     """
     results: list[SolveResult] = []
 
@@ -221,10 +222,8 @@ def crack_unknown(ciphertext: str, *, top_n: int = 10, include: set[str] | None 
 
     scored: list[SolveResult] = []
     for r in results:
-        # use plugin score if provided (ranking/display)
         s = _score_from_result(r)
 
-        # compute confidence from a "raw" score that matches the confidence model
         conf_score = confidence_score(r.plaintext)
         conf = confidence_from_score(r.plaintext, conf_score)
 
@@ -238,10 +237,21 @@ def crack_unknown(ciphertext: str, *, top_n: int = 10, include: set[str] | None 
             meta=r.meta,
         ))
 
-    # Auto-mode pruning: remove obvious gibberish / ultra-low confidence AFTER computing confidence
-    if include is None:
-        scored = [x for x in scored if x.confidence >= 0.05 and gibberish_probability(x.plaintext) <= 0.85]
-
     scored = _dedupe_by_plaintext(scored)
     scored.sort(key=lambda x: x.score, reverse=True)
+
+    # Auto-mode pruning AFTER confidence is computed, with length-adaptive thresholds
+    if include is None and scored:
+        n_in = len(normalize_az(ciphertext))
+
+        # For short inputs, confidence is intentionally low; don't throw everything away.
+        conf_cut = 0.01 if n_in < 180 else 0.05
+        gib_cut = 0.92 if n_in < 180 else 0.85
+
+        pruned = [x for x in scored if x.confidence >= conf_cut and gibberish_probability(x.plaintext) <= gib_cut]
+
+        # Never prune to empty if we had candidates; just return best-ranked
+        if pruned:
+            scored = pruned
+
     return scored[:top_n]

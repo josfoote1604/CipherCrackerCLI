@@ -14,7 +14,7 @@ from ciphercracker.core.scoring import (
     get_quadgram_scorer,
     quadgram_score,
     english_likeness_score,
-    word_bonus,  # NEW: light word signal for short-text annealing guidance
+    word_bonus,
 )
 from ciphercracker.core.utils import normalize_az
 from ciphercracker.classical.common import parse_substitution_key, ALPHABET
@@ -250,13 +250,115 @@ def _better_pair(a: Tuple[float, float], b: Tuple[float, float], eps: float = 1e
 
 
 # ----------------------------
-# Targeted polish
+# Targeted polish helpers
 # ----------------------------
 
 def _top_cipher_letters_by_freq(occ: list[list[int]], top_k: int) -> list[int]:
     order = sorted(range(26), key=lambda c: len(occ[c]), reverse=True)
     return order[:top_k]
 
+
+# ----------------------------
+# Final short-text refinement (GENERIC, no hardcoding)
+# ----------------------------
+
+def _shorttext_final_refine(
+    ciphertext: str,
+    letters_meta,
+    positions,
+    cases,
+    pt_letters: list[str],
+    mapping: list[str],
+    occ: list[list[int]],
+    *,
+    time_up_fn,
+    top_k_letters: int = 12,
+    max_moves: int = 18,
+    word_w: float = 0.8,
+    wb_w: float = 0.01,
+    allow_primary_drop: float = 25.0,
+) -> tuple[float, list[str], list[str]]:
+    """
+    Generic final refinement for short texts:
+      - explore swaps among the most frequent cipher letters
+      - choose move that maximizes:
+            eval = primary_quad + word_w * word_bonus(fulltext) + wb_w * wordbreak(fulltext)
+      - keep reporting primary (quadgrams) as the solver score
+
+    This is exactly what fixes 'REAP/CRACZER/POING' style near-misses without any fixed key.
+    """
+    if get_quadgram_scorer() is None:
+        return _score_letters_only(pt_letters), mapping, pt_letters
+
+    cand = _top_cipher_letters_by_freq(occ, top_k_letters)
+
+    def eval_state(primary: float) -> float:
+        pt_full = _apply_to_fulltext(ciphertext, positions, cases, mapping, letters_meta)
+        wb = _wordbreak_score_text(pt_full)
+        return primary + word_w * word_bonus(pt_full) + wb_w * wb
+
+    cur_primary = _score_letters_only(pt_letters)
+    cur_eval = eval_state(cur_primary)
+
+    moves = 0
+    while moves < max_moves and not time_up_fn():
+        best_eval = cur_eval
+        best_primary = cur_primary
+        best_swap = None
+
+        # try all swaps in candidate set
+        for ai in range(len(cand)):
+            if time_up_fn():
+                break
+            i = cand[ai]
+            for aj in range(ai + 1, len(cand)):
+                j = cand[aj]
+
+                # apply swap
+                mapping[i], mapping[j] = mapping[j], mapping[i]
+                for idx in occ[i]:
+                    pt_letters[idx] = mapping[i]
+                for idx in occ[j]:
+                    pt_letters[idx] = mapping[j]
+
+                p = _score_letters_only(pt_letters)
+
+                # avoid spending time on clearly-worse basins
+                if p >= cur_primary - allow_primary_drop:
+                    e = eval_state(p)
+                    if e > best_eval + 1e-9:
+                        best_eval = e
+                        best_primary = p
+                        best_swap = (i, j)
+
+                # revert
+                mapping[i], mapping[j] = mapping[j], mapping[i]
+                for idx in occ[i]:
+                    pt_letters[idx] = mapping[i]
+                for idx in occ[j]:
+                    pt_letters[idx] = mapping[j]
+
+        if best_swap is None:
+            break
+
+        # commit best swap
+        i, j = best_swap
+        mapping[i], mapping[j] = mapping[j], mapping[i]
+        for idx in occ[i]:
+            pt_letters[idx] = mapping[i]
+        for idx in occ[j]:
+            pt_letters[idx] = mapping[j]
+
+        cur_eval = best_eval
+        cur_primary = best_primary
+        moves += 1
+
+    return cur_primary, mapping, pt_letters
+
+
+# ----------------------------
+# Greedy swap polish
+# ----------------------------
 
 def _greedy_swap_polish(
     pt_letters: list[str],
@@ -316,6 +418,10 @@ def _greedy_swap_polish(
     return cur_s, mapping, pt_letters
 
 
+# ----------------------------
+# Targeted k-opt polish (swap + 3-cycles)
+# ----------------------------
+
 def _targeted_kopt_polish(
     ciphertext: str,
     letters_meta,
@@ -329,11 +435,6 @@ def _targeted_kopt_polish(
     top_k_letters: int = 10,
     max_moves: int = 8,
 ) -> Tuple[float, list[str], list[str]]:
-    """
-    Targeted k-opt polish (swap + 3-cycles on frequent letters).
-    Primary: quadgrams on letters-only plaintext.
-    Tie-break: DP wordbreak (only between near-equal primaries).
-    """
     cand = _top_cipher_letters_by_freq(occ, top_k_letters)
 
     def cur_pair() -> Tuple[float, float]:
@@ -454,6 +555,10 @@ def _targeted_kopt_polish(
     return cur[0], mapping, pt_letters
 
 
+# ----------------------------
+# Targeted 4-opt polish (double swap + 4-cycles)
+# ----------------------------
+
 def _targeted_4opt_polish(
     ciphertext: str,
     letters_meta,
@@ -468,11 +573,6 @@ def _targeted_4opt_polish(
     max_moves: int = 5,
     near_eps: float = 0.35,
 ) -> tuple[float, list[str], list[str]]:
-    """
-    Limited 4-opt polish (double swap + 4-cycles on frequent letters).
-    Primary: quadgrams letters-only.
-    Tie-break: DP wordbreak only when primary is close.
-    """
     cand = _top_cipher_letters_by_freq(occ, top_k_letters)
 
     def cur_pair() -> tuple[float, float]:
@@ -615,14 +715,6 @@ def crack_substitution_anneal(
     max_seconds: float | None = 35.0,
     elite_k: int = 3,
 ) -> list[tuple[float, list[str], str]]:
-    """
-    Monoalphabetic substitution solver.
-
-    Primary objective (reported score): quadgrams on letters-only plaintext.
-    For SHORT texts, annealing acceptance is guided by a tiny word signal (word_bonus on fulltext)
-    to help escape "half-English impostor" basins.
-    Also keeps a GLOBAL beam of top states across the whole run for extra robustness.
-    """
     start = time.perf_counter()
     rng = random.Random(seed)
 
@@ -634,20 +726,17 @@ def crack_substitution_anneal(
     occ = _build_occ(letters_meta)
     use_quad = get_quadgram_scorer() is not None
 
-    # Short-text guidance strength. word_bonus is bounded roughly [-10, +20].
-    # This makes it a gentle nudge (order ~ +/- 6..12) relative to quadgram deltas.
     use_word_guidance = (n_letters < 180 and use_quad)
     word_w = 0.6 if use_word_guidance else 0.0
 
     def time_up() -> bool:
         return max_seconds is not None and (time.perf_counter() - start) >= max_seconds
 
-    # Store as (primary_score, tie_score, mapping_copy, plaintext_full)
     best_across: list[tuple[float, float, list[str], str]] = []
 
     # Global beam: store (eval_score, primary_score, mapping, pt_letters)
     beam: list[tuple[float, float, list[str], list[str]]] = []
-    BEAM_K = 40
+    BEAM_K = 60 if n_letters < 180 else 40
 
     def beam_push(eval_s: float, primary_s: float, mapping: list[str], pt_letters: list[str]) -> None:
         beam.append((eval_s, primary_s, mapping[:], pt_letters[:]))
@@ -675,7 +764,6 @@ def crack_substitution_anneal(
         else:
             cur_eval = cur_primary
 
-        # elites store: (eval_score, primary_score, mapping, pt_letters)
         elites: list[tuple[float, float, list[str], list[str]]] = [(cur_eval, cur_primary, mapping[:], pt_letters[:])]
 
         for step in range(steps):
@@ -688,7 +776,6 @@ def crack_substitution_anneal(
             if i == j:
                 continue
 
-            # propose swap
             mapping[i], mapping[j] = mapping[j], mapping[i]
             for idx in occ[i]:
                 pt_letters[idx] = mapping[i]
@@ -712,7 +799,6 @@ def crack_substitution_anneal(
                 cur_eval = new_eval
                 cur_primary = new_primary
 
-                # maintain elites by eval_score (guidance helps short text)
                 inserted = False
                 for ei, (es, _, _, _) in enumerate(elites):
                     if new_eval > es:
@@ -724,19 +810,17 @@ def crack_substitution_anneal(
                 if len(elites) > elite_k:
                     elites = elites[:elite_k]
             else:
-                # revert
                 mapping[i], mapping[j] = mapping[j], mapping[i]
                 for idx in occ[i]:
                     pt_letters[idx] = mapping[i]
                 for idx in occ[j]:
                     pt_letters[idx] = mapping[j]
 
-        # push elites into global beam
         for (es, ps, m, pl) in elites:
             beam_push(es, ps, m, pl)
 
-        # polish each elite; pick best per restart by PRIMARY (reporting objective)
         best_restart = None  # (primary, mapping, pt_letters)
+
         for (_es, _ps, m0, pl0) in elites:
             if time_up():
                 break
@@ -745,13 +829,8 @@ def crack_substitution_anneal(
 
             if use_quad and not time_up():
                 s2, m2, pl2 = _targeted_kopt_polish(
-                    ciphertext,
-                    letters_meta,
-                    positions,
-                    cases,
-                    pl1,
-                    m1,
-                    occ,
+                    ciphertext, letters_meta, positions, cases,
+                    pl1, m1, occ,
                     time_up_fn=time_up,
                     top_k_letters=10 if n_letters < 220 else 12,
                     max_moves=7 if n_letters < 220 else 6,
@@ -761,13 +840,8 @@ def crack_substitution_anneal(
 
             if use_quad and not time_up():
                 s3, m3, pl3 = _targeted_4opt_polish(
-                    ciphertext,
-                    letters_meta,
-                    positions,
-                    cases,
-                    pl2,
-                    m2,
-                    occ,
+                    ciphertext, letters_meta, positions, cases,
+                    pl2, m2, occ,
                     time_up_fn=time_up,
                     top_k_letters=9 if n_letters < 220 else 11,
                     max_moves=5 if n_letters < 220 else 4,
@@ -775,8 +849,23 @@ def crack_substitution_anneal(
             else:
                 s3, m3, pl3 = s2, m2, pl2
 
-            if best_restart is None or s3 > best_restart[0]:
-                best_restart = (s3, m3, pl3)
+            # NEW: short-text final refinement (generic)
+            if use_quad and n_letters < 220 and not time_up():
+                s4, m4, pl4 = _shorttext_final_refine(
+                    ciphertext, letters_meta, positions, cases,
+                    pl3, m3, occ,
+                    time_up_fn=time_up,
+                    top_k_letters=12,
+                    max_moves=18,
+                    word_w=0.8,
+                    wb_w=0.01,
+                    allow_primary_drop=25.0,
+                )
+            else:
+                s4, m4, pl4 = s3, m3, pl3
+
+            if best_restart is None or s4 > best_restart[0]:
+                best_restart = (s4, m4, pl4)
 
         if best_restart is not None:
             s_best, m_best, _pl_best = best_restart
@@ -786,7 +875,7 @@ def crack_substitution_anneal(
 
     # ---- polish global beam too ----
     if beam:
-        beam.sort(key=lambda x: x[0], reverse=True)  # by eval score
+        beam.sort(key=lambda x: x[0], reverse=True)
         beam = beam[:BEAM_K]
 
         for (_es, _ps, m0, pl0) in beam:
@@ -797,13 +886,8 @@ def crack_substitution_anneal(
 
             if use_quad and not time_up():
                 s2, m2, pl2 = _targeted_kopt_polish(
-                    ciphertext,
-                    letters_meta,
-                    positions,
-                    cases,
-                    pl1,
-                    m1,
-                    occ,
+                    ciphertext, letters_meta, positions, cases,
+                    pl1, m1, occ,
                     time_up_fn=time_up,
                     top_k_letters=10 if n_letters < 220 else 12,
                     max_moves=7 if n_letters < 220 else 6,
@@ -813,13 +897,8 @@ def crack_substitution_anneal(
 
             if use_quad and not time_up():
                 s3, m3, pl3 = _targeted_4opt_polish(
-                    ciphertext,
-                    letters_meta,
-                    positions,
-                    cases,
-                    pl2,
-                    m2,
-                    occ,
+                    ciphertext, letters_meta, positions, cases,
+                    pl2, m2, occ,
                     time_up_fn=time_up,
                     top_k_letters=9 if n_letters < 220 else 11,
                     max_moves=5 if n_letters < 220 else 4,
@@ -827,14 +906,26 @@ def crack_substitution_anneal(
             else:
                 s3, m3, pl3 = s2, m2, pl2
 
-            pt_full = _apply_to_fulltext(ciphertext, positions, cases, m3, letters_meta)
+            # NEW: short-text final refinement (generic)
+            if use_quad and n_letters < 220 and not time_up():
+                s4, m4, pl4 = _shorttext_final_refine(
+                    ciphertext, letters_meta, positions, cases,
+                    pl3, m3, occ,
+                    time_up_fn=time_up,
+                    top_k_letters=12,
+                    max_moves=18,
+                    word_w=0.8,
+                    wb_w=0.01,
+                    allow_primary_drop=25.0,
+                )
+            else:
+                s4, m4, pl4 = s3, m3, pl3
+
+            pt_full = _apply_to_fulltext(ciphertext, positions, cases, m4, letters_meta)
             tie = _wordbreak_score_text(pt_full)
-            best_across.append((s3, tie, m3[:], pt_full))
+            best_across.append((s4, tie, m4[:], pt_full))
 
-    # Final ordering: primary first, tie-break only within near bands
     best_across = _sort_near_band(best_across, near=_PRIMARY_NEAR)
-
-    # keep top few
     return [(s, m, pt) for (s, _tie, m, pt) in best_across[:5]]
 
 
@@ -861,9 +952,7 @@ class SubstitutionCipher:
     def crack(self, ciphertext: str) -> list[SolveResult]:
         az_len = len(normalize_az(ciphertext))
 
-        # Length-adaptive defaults:
         if az_len < 180:
-            # exploration-heavy
             restarts = 160
             steps = 8000
             temp_start = 22.0
