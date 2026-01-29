@@ -4,15 +4,16 @@ import math
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol
 
+from ciphercracker.core.utils import normalize_az
+
 from .results import SolveResult
 from .scoring import (
     english_likeness_score,
     get_quadgram_scorer,
-    quadgram_score,
-    plaintext_fitness,
     gibberish_probability,
+    plaintext_fitness,
+    quadgram_score,
 )
-from ciphercracker.core.utils import normalize_az
 
 
 def _cipher_preference(cipher_name: str, key: str | None) -> int:
@@ -25,9 +26,9 @@ def _cipher_preference(cipher_name: str, key: str | None) -> int:
     # Detect affine special cases
     if name == "affine" and key:
         k = key.replace(" ", "")
-        if k.startswith("1,"):   # a=1 => Caesar
+        if k.startswith("1,"):  # a=1 => Caesar
             return 3
-        if k == "25,25":         # Atbash
+        if k == "25,25":  # Atbash
             return 2
 
     pref = {
@@ -92,9 +93,18 @@ def rank_score(text: str) -> float:
 def _length_confidence_scale(n_letters: int) -> float:
     """
     Downscale confidence for short texts where n-gram scoring is noisy.
-    Keeps short-text results from looking falsely "certain".
+
+    Old behavior (n/180) was *very* conservative and dragged medium-length
+    correct decrypts down (e.g., ~80-120 letters).
+
+    New behavior:
+      - reaches ~1.0 around ~100 letters
+      - still clamps low for very short strings
     """
-    scale = n_letters / 180.0
+    if n_letters <= 0:
+        return 0.25
+
+    scale = n_letters / 100.0  # 100 letters -> ~1.0
     if scale < 0.25:
         scale = 0.25
     if scale > 1.0:
@@ -108,6 +118,11 @@ def confidence_from_score(text: str, score: float) -> float:
     - In quadgram mode, use average log10 prob per quadgram (score / (n-3)).
     - Apply a length-based downscale so short texts don't appear overly confident.
     - In fallback mode, keep old scaling (also length-scaled lightly).
+
+    Tuning notes:
+    - avg quadgram log10 per quadgram tends to be around:
+        ~ -4.8 .. -4.2 for strong English plaintext
+        ~ -5.2 .. lower for weak/gibberish
     """
     n_letters = len(normalize_az(text))
     length_scale = _length_confidence_scale(n_letters)
@@ -117,8 +132,13 @@ def confidence_from_score(text: str, score: float) -> float:
         q = max(1, len(t) - 3)
         avg = score / q  # log10 prob per quadgram (negative)
 
-        conf = _sigmoid(4.0 * (avg + 4.6))  # tune 4.6 and slope 4.0
+        # Retuned mapping:
+        # If avg ≈ -4.8 -> 0.5
+        # If avg ≈ -4.4 -> ~0.88
+        # If avg ≈ -5.2 -> ~0.12
+        conf = _sigmoid(5.0 * (avg + 4.8))
         conf = max(0.0, min(1.0, conf))
+
         conf *= length_scale
         return max(0.0, min(1.0, conf))
 
@@ -227,18 +247,57 @@ def crack_unknown(ciphertext: str, *, top_n: int = 10, include: set[str] | None 
         conf_score = confidence_score(r.plaintext)
         conf = confidence_from_score(r.plaintext, conf_score)
 
-        scored.append(SolveResult(
-            cipher_name=r.cipher_name,
-            plaintext=r.plaintext,
-            key=r.key,
-            score=s,
-            confidence=conf,
-            notes=r.notes,
-            meta=r.meta,
-        ))
+        scored.append(
+            SolveResult(
+                cipher_name=r.cipher_name,
+                plaintext=r.plaintext,
+                key=r.key,
+                score=s,
+                confidence=conf,
+                notes=r.notes,
+                meta=r.meta,
+            )
+        )
 
     scored = _dedupe_by_plaintext(scored)
     scored.sort(key=lambda x: x.score, reverse=True)
+
+    # --- Optional: relative confidence adjustment (winner gap) ---
+    # NOTE: SolveResult is frozen, so we must rebuild objects instead of mutating fields.
+    if scored and get_quadgram_scorer() is not None and len(scored) >= 2:
+
+        def avgq(r: SolveResult) -> float:
+            t = normalize_az(r.plaintext or "")
+            q = max(1, len(t) - 3)
+            return quadgram_score(t) / q
+
+        a0 = avgq(scored[0])
+        a1 = avgq(scored[1])
+
+        gap = a0 - a1  # positive means winner better
+        if gap > 0.10:  # tune: 0.08–0.15 reasonable
+            boost = min(0.20, 0.8 * gap)  # cap boost
+
+            adjusted: list[SolveResult] = []
+            for idx, r in enumerate(scored):
+                if idx == 0:
+                    new_conf = max(0.0, min(1.0, r.confidence + boost))
+                else:
+                    new_conf = max(0.0, min(1.0, r.confidence * (1.0 - 0.25 * boost)))
+
+                adjusted.append(
+                    SolveResult(
+                        cipher_name=r.cipher_name,
+                        plaintext=r.plaintext,
+                        key=r.key,
+                        score=r.score,
+                        confidence=new_conf,
+                        notes=r.notes,
+                        meta=r.meta,
+                    )
+                )
+
+            scored = adjusted
 
     # Auto-mode pruning AFTER confidence is computed, with length-adaptive thresholds
     if include is None and scored:

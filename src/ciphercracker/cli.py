@@ -4,7 +4,6 @@ from typing import List, Optional
 
 import typer
 
-from ciphercracker.core.utils import normalize_az
 from ciphercracker.classical import register_all
 from ciphercracker.core.features import analyze_text
 from ciphercracker.core.registry import crack_unknown, decrypt_known, list_plugins
@@ -55,6 +54,7 @@ def decrypt(
         raise typer.BadParameter(str(e))
     typer.echo(pt)
 
+
 def _effective_score(r) -> float:
     # Prefer "best_full" if present (periodic_sub uses it)
     if r.meta and isinstance(r.meta, dict) and "best_full" in r.meta:
@@ -64,75 +64,6 @@ def _effective_score(r) -> float:
             pass
     return float(r.score)
 
-def _cipher_preference(cipher_name: str, key: str | None) -> int:
-    """
-    Lower is better. Prefer more specific ciphers when plaintext is identical.
-    Also demote affine when it is effectively caesar or atbash.
-    """
-    name = (cipher_name or "").lower()
-
-    # Detect affine special cases
-    if name == "affine" and key:
-        k = key.replace(" ", "")
-        if k.startswith("1,"):       # a=1 => Caesar
-            return 2
-        if k == "25,25":             # Atbash
-            return 1
-
-    pref = {
-        "atbash": 1,
-        "caesar": 2,
-        "affine": 3,
-        "substitution": 4,
-        "periodic_substitution": 5,
-        "vigenere": 6,
-    }
-    return pref.get(name, 50)
-
-def dedupe_results(results):
-    best_by_fp = {}
-
-    for r in results:
-        fp = normalize_az(r.plaintext or "")
-        if not fp:
-            continue
-
-        cur = best_by_fp.get(fp)
-        if cur is None:
-            best_by_fp[fp] = r
-            continue
-
-        # Decide if r is better than cur
-        r_score = _effective_score(r)
-        c_score = _effective_score(cur)
-
-        if r_score > c_score:
-            best_by_fp[fp] = r
-            continue
-        if r_score < c_score:
-            continue
-
-        # Tie-break: confidence then cipher preference
-        if r.confidence > cur.confidence:
-            best_by_fp[fp] = r
-            continue
-        if r.confidence < cur.confidence:
-            continue
-
-        if _cipher_preference(r.cipher_name, r.key) < _cipher_preference(cur.cipher_name, cur.key):
-            best_by_fp[fp] = r
-
-    # Return sorted list
-    uniq = list(best_by_fp.values())
-    uniq.sort(
-        key=lambda x: (
-            _effective_score(x),
-            x.confidence,
-            -_cipher_preference(x.cipher_name, x.key),  # invert because higher key would sort later otherwise
-        ),
-        reverse=True,
-    )
-    return uniq
 
 @app.command()
 def crack(
@@ -165,12 +96,13 @@ def crack(
 
     if iocmax > 0:
         from ciphercracker.core.features import ioc_scan
+
         typer.echo("\nTop IoC candidates:")
         for klen, val in ioc_scan(text, max_len=iocmax)[:10]:
             typer.echo(f"  k={klen:2d}  avg_ioc={val:.5f}")
         typer.echo("")
 
-    # Request extra candidates so de-dupe doesn't shrink results too much
+    # Request extra candidates so registry-side de-dupe doesn't shrink results too much
     fetch_n = max(top * 5, top)
     results = crack_unknown(text, top_n=fetch_n, include=include)
 
@@ -178,7 +110,8 @@ def crack(
         typer.echo("No candidates produced. Input may be too short or not supported yet.")
         raise typer.Exit(code=0)
 
-    results = dedupe_results(results)[:top]
+    # Registry already de-dupes and sorts; just take top N
+    results = results[:top]
 
     for i, r in enumerate(results, start=1):
         shown_score = _effective_score(r)
@@ -193,7 +126,6 @@ def crack(
         if r.plaintext:
             typer.echo(r.plaintext)
         typer.echo("-" * 60)
-
 
 
 def main():
