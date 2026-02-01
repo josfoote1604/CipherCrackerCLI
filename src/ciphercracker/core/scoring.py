@@ -88,7 +88,8 @@ def get_common_words() -> set[str]:
     return _COMMON_WORDS
 
 
-_WORD_RE = re.compile(r"[A-Z]{2,}")
+#_WORD_RE = re.compile(r"[A-Z]{2,}")
+_WORD_RE = re.compile(r"[A-Z]+")
 
 def chi_squared_english(az_text: str) -> float:
     """Lower is better."""
@@ -108,7 +109,10 @@ def chi_squared_english(az_text: str) -> float:
 
 def _extract_words(text: str) -> list[str]:
     cleaned = normalize_keep_spaces(text).upper()
-    return _WORD_RE.findall(cleaned)
+    words = _WORD_RE.findall(cleaned)
+    words = [w for w in words if len(w) >= 2 or w in ("A", "I")]
+    return words
+
 
 def word_hit_rate(text: str) -> float:
     words = _extract_words(text)
@@ -129,16 +133,6 @@ def word_bonus(text: str) -> float:
     hr = word_hit_rate(text)  # 0..1
     # Cap effect: 0..+8 (tiny compared to quadgrams, but useful for tie-break)
     return min(8.0, 8.0 * hr)
-
-
-def plaintext_fitness(text: str) -> float:
-    """
-    The score you should use for ranking/hillclimbing.
-    Higher is better.
-    """
-    # Use A-Z normalization for quadgrams (generally improves stability)
-    az = normalize_az(text)
-    return quadgram_score(az) + word_bonus(text)
 
 def english_likeness_score(text: str) -> float:
     """

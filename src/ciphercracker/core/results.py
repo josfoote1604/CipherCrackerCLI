@@ -4,8 +4,11 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, order=True)
 class SolveResult:
+    # sort_index comes first so dataclass ordering uses it automatically
+    sort_index: tuple[float, float, int] = field(init=False, repr=False)
+
     cipher_name: str
     plaintext: str
     key: Optional[str] = None
@@ -19,6 +22,11 @@ class SolveResult:
 
     # Extra metadata for future (e.g., detected encoding, key length, etc.)
     meta: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # dataclass(order=True) sorts ascending; we want score/conf descending,
+        # so we negate them. Add plaintext length as a stable, weak tie-break.
+        object.__setattr__(self, "sort_index", (-self.score, -self.confidence, -len(self.plaintext)))
 
     def to_dict(self) -> dict[str, Any]:
         return {

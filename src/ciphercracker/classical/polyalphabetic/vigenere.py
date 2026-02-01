@@ -4,9 +4,9 @@ from collections import Counter
 
 from ciphercracker.core.registry import register_plugin
 from ciphercracker.core.results import SolveResult
-from ciphercracker.core.scoring import chi_squared_english, plaintext_fitness
+from ciphercracker.core.scoring import chi_squared_english
 from ciphercracker.classical.common import norm_key_alpha, shift_char, ALPHABET
-from ciphercracker.classical.polyalphabetic.gating import should_try_vigenere
+from .gating import should_try_vigenere
 
 
 def _vigenere_decrypt(text: str, key: str) -> str:
@@ -52,54 +52,6 @@ def _avg_ioc_for_keylen(az: str, keylen: int) -> float:
     return sum(iocs) / len(iocs) if iocs else 0.0
 
 
-def _reduce_repeating_key(key: str) -> str:
-    """
-    If a key is a perfect repetition of a shorter pattern, reduce it.
-    Example: CYBERCYBER -> CYBER
-    """
-    k = norm_key_alpha(key)
-    if not k:
-        return key
-
-    for p in range(1, len(k) // 2 + 1):
-        if len(k) % p != 0:
-            continue
-        base = k[:p]
-        if base * (len(k) // p) == k:
-            return base
-
-    return k
-
-
-def _best_folded_prefix_key(ciphertext: str, key_full: str) -> tuple[str, float]:
-    """
-    Even if key_full isn't a perfect repetition, try folding it to a shorter prefix.
-    For each p < len(key_full), try key = key_full[:p] and keep whichever gives best plaintext_fitness.
-
-    This is the key fix for cases like:
-      CYBERCYCRR  -> best prefix likely CYBER
-    """
-    k = norm_key_alpha(key_full)
-    if not k or len(k) < 2:
-        pt = _vigenere_decrypt(ciphertext, key_full)
-        return key_full, plaintext_fitness(pt)
-
-    best_key = k
-    best_fit = plaintext_fitness(_vigenere_decrypt(ciphertext, k))
-
-    # Try all shorter prefix lengths.
-    # (You can restrict this to divisors if you want speed, but this is still cheap: <= 24 tries.)
-    for p in range(1, len(k)):
-        cand = k[:p]
-        pt = _vigenere_decrypt(ciphertext, cand)
-        fit = plaintext_fitness(pt)
-        if fit > best_fit:
-            best_fit = fit
-            best_key = cand
-
-    return best_key, best_fit
-
-
 class VigenereCipher:
     name = "vigenere"
 
@@ -107,106 +59,85 @@ class VigenereCipher:
         return _vigenere_decrypt(ciphertext, key)
 
     def crack(self, ciphertext: str) -> list[SolveResult]:
+        from ciphercracker.core.scoring import english_likeness_score
+
         az = _only_az(ciphertext)
         n = len(az)
-        if n < 20:
+        if n < 30:
             return []
 
         # --- key length candidates ---
         max_klen = min(24, max(2, n // 3))
-        lens: list[tuple[float, float, int]] = []
+        lens = []
         for klen in range(2, max_klen + 1):
             cols = [az[i::klen] for i in range(klen)]
             if min(len(c) for c in cols) < 6:
                 continue
             avg_ioc = _avg_ioc_for_keylen(az, klen)
-
-            # Stronger penalty for longer keys so fundamentals (e.g., 5) beat multiples (e.g., 10)
-            score = avg_ioc - (0.006 * klen)
+            score = avg_ioc - (0.002 * klen)
             lens.append((score, avg_ioc, klen))
 
         if not lens:
             return []
 
         lens.sort(reverse=True)
-        top_lens = [klen for _, _, klen in lens[:10]]
+        top_lens = [klen for _, _, klen in lens[:6]]
 
         results: list[SolveResult] = []
 
-        # --- beam search settings ---
         TOP_SHIFTS_PER_COL = 4
-        BEAM_WIDTH = 250
+        BEAM_WIDTH = 150
+
+        def top_shifts_for_column(col: str, top_k: int) -> list[int]:
+            scored = []
+            for shift in range(26):
+                dec = "".join(shift_char(ch, -shift) for ch in col)
+                chi = chi_squared_english(dec)
+                scored.append((chi, shift))
+            scored.sort(key=lambda x: x[0])
+            return [s for _, s in scored[:top_k]]
 
         for klen in top_lens:
             cols = [az[i::klen] for i in range(klen)]
+            col_shift_options = [top_shifts_for_column(c, TOP_SHIFTS_PER_COL) for c in cols]
 
-            # Precompute chi-squared table per column/shift.
-            chi_table: list[list[float]] = []
-            for c in cols:
-                row = []
-                for shift in range(26):
-                    dec = "".join(shift_char(ch, -shift) for ch in c)
-                    row.append(chi_squared_english(dec))
-                chi_table.append(row)
-
-            def top_shifts_for_column(col_idx: int, top_k: int) -> list[int]:
-                row = chi_table[col_idx]
-                ranked = sorted(range(26), key=lambda s: row[s])
-                return ranked[:top_k]
-
-            col_shift_options = [
-                top_shifts_for_column(i, TOP_SHIFTS_PER_COL) for i in range(klen)
-            ]
-
-            # Beam holds tuples: (score, key_shifts_list)
             beam: list[tuple[float, list[int]]] = [(0.0, [])]
 
             for col_idx in range(klen):
                 new_beam: list[tuple[float, list[int]]] = []
-                for score, partial in beam:
+                for _, partial in beam:
                     for shift in col_shift_options[col_idx]:
-                        new_score = score - chi_table[col_idx][shift]
-                        new_beam.append((new_score, partial + [shift]))
+                        candidate = partial + [shift]
+                        key = "".join(chr(ord("A") + s) for s in candidate)
+                        pt = _vigenere_decrypt(ciphertext, key)
+                        s = english_likeness_score(pt)
+                        new_beam.append((s, candidate))
 
                 new_beam.sort(key=lambda x: x[0], reverse=True)
                 beam = new_beam[:BEAM_WIDTH]
 
-            # Evaluate final candidates from beam using true plaintext fitness.
-            # Also try:
-            #  - perfect-repeat reduction (CYBERCYBER -> CYBER)
-            #  - best prefix folding (CYBERCYCRR -> CYBER if that scores better)
-            for _, shifts in beam[:40]:
-                key_full = "".join(chr(ord("A") + sh) for sh in shifts)
-
-                candidate_keys: list[tuple[str, str]] = [(key_full, "raw")]
-
-                key_rep = _reduce_repeating_key(key_full)
-                if key_rep != key_full:
-                    candidate_keys.append((key_rep, "reduced_repeat"))
-
-                key_fold, _ = _best_folded_prefix_key(ciphertext, key_full)
-                if key_fold != key_full and key_fold != key_rep:
-                    candidate_keys.append((key_fold, "folded_prefix"))
-
-                for key, kind in candidate_keys:
-                    pt = _vigenere_decrypt(ciphertext, key)
-                    fit = plaintext_fitness(pt)
-
-                    results.append(
-                        SolveResult(
-                            cipher_name=self.name,
-                            plaintext=pt,
-                            key=key,
-                            notes=f"Beam search keylen={klen} ({kind})",
-                            meta={"key_length": klen, "fitness": fit, "postprocess": kind},
-                        )
+            for s, shifts in beam[:12]:
+                key = "".join(chr(ord("A") + sh) for sh in shifts)
+                pt = _vigenere_decrypt(ciphertext, key)
+                results.append(
+                    SolveResult(
+                        cipher_name=self.name,
+                        plaintext=pt,
+                        key=key,
+                        notes=f"Beam search keylen={klen}",
+                        meta={"key_length": klen},
                     )
+                )
 
-        results.sort(key=lambda r: r.meta.get("fitness", float("-inf")), reverse=True)
         return results
 
     def fingerprint(self, ciphertext: str) -> dict:
         return {"family": "polyalphabetic"}
 
 
-register_plugin(VigenereCipher(), should_try=should_try_vigenere)
+def register() -> None:
+    register_plugin(VigenereCipher(), should_try=should_try_vigenere)
+
+
+# If your project expects modules to self-register on import, keep this:
+register()

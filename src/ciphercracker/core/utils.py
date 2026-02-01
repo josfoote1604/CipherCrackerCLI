@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import math
 import string
+import re
 from collections import Counter
 from typing import Iterable
 
+
+_AZ_ONLY_RE = re.compile(r"[^A-Z]+")
 
 ASCII_PRINTABLE = set(string.printable)
 
@@ -27,10 +30,15 @@ def normalize_keep_spaces(s: str) -> str:
     return cleaned.upper()
 
 
+
 def normalize_az(s: str) -> str:
-    """Keep only A-Z, uppercase."""
-    s = s.upper()
-    return "".join(ch for ch in s if "A" <= ch <= "Z")
+    """Keep only A-Z, uppercase. Hardened against odd shadowing bugs."""
+    if s is None:
+        return ""
+    # ensure we are working with a real string
+    s = f"{s}".upper()
+    # strip non A-Z
+    return _AZ_ONLY_RE.sub("", s)
 
 
 def shannon_entropy(s: str) -> float:

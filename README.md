@@ -1,8 +1,11 @@
 # NOTICE
 
-- WORK IN PROGRESS: Last updated 01/28/2026. 
+- WORK IN PROGRESS: Last updated 01/31/2026. 
 - This project is a homelab project and is not intended for production use. 
 - This project has used AI/Coding Agents to help with the development process.
+
+# Version Number
+- 0.1.0
 
 # CipherCracker CLI
 

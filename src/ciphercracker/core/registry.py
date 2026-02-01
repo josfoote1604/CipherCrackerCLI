@@ -1,19 +1,18 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional, Protocol
-
-from ciphercracker.core.utils import normalize_az
 
 from .results import SolveResult
 from .scoring import (
     english_likeness_score,
     get_quadgram_scorer,
-    gibberish_probability,
-    plaintext_fitness,
     quadgram_score,
+    plaintext_fitness,
+    gibberish_probability,
 )
+from ciphercracker.core.utils import normalize_az
 
 
 def _cipher_preference(cipher_name: str, key: str | None) -> int:
@@ -26,9 +25,9 @@ def _cipher_preference(cipher_name: str, key: str | None) -> int:
     # Detect affine special cases
     if name == "affine" and key:
         k = key.replace(" ", "")
-        if k.startswith("1,"):  # a=1 => Caesar
+        if k.startswith("1,"):   # a=1 => Caesar
             return 3
-        if k == "25,25":  # Atbash
+        if k == "25,25":         # Atbash
             return 2
 
     pref = {
@@ -94,12 +93,8 @@ def _length_confidence_scale(n_letters: int) -> float:
     """
     Downscale confidence for short texts where n-gram scoring is noisy.
 
-    Old behavior (n/180) was *very* conservative and dragged medium-length
-    correct decrypts down (e.g., ~80-120 letters).
-
-    New behavior:
-      - reaches ~1.0 around ~100 letters
-      - still clamps low for very short strings
+    New behavior reaches ~1.0 around ~100 letters, but clamps low
+    for very short strings.
     """
     if n_letters <= 0:
         return 0.25
@@ -115,14 +110,9 @@ def _length_confidence_scale(n_letters: int) -> float:
 def confidence_from_score(text: str, score: float) -> float:
     """
     Confidence heuristic:
-    - In quadgram mode, use average log10 prob per quadgram (score / (n-3)).
-    - Apply a length-based downscale so short texts don't appear overly confident.
-    - In fallback mode, keep old scaling (also length-scaled lightly).
-
-    Tuning notes:
-    - avg quadgram log10 per quadgram tends to be around:
-        ~ -4.8 .. -4.2 for strong English plaintext
-        ~ -5.2 .. lower for weak/gibberish
+    - In quadgram mode, use avg log10 prob per quadgram (score / (n-3)).
+    - Apply length downscale so short texts don't look overly certain.
+    - In fallback mode, map english_likeness_score into 0..1.
     """
     n_letters = len(normalize_az(text))
     length_scale = _length_confidence_scale(n_letters)
@@ -132,13 +122,9 @@ def confidence_from_score(text: str, score: float) -> float:
         q = max(1, len(t) - 3)
         avg = score / q  # log10 prob per quadgram (negative)
 
-        # Retuned mapping:
-        # If avg ≈ -4.8 -> 0.5
-        # If avg ≈ -4.4 -> ~0.88
-        # If avg ≈ -5.2 -> ~0.12
+        # Center at -4.8; slope ~5.0
         conf = _sigmoid(5.0 * (avg + 4.8))
         conf = max(0.0, min(1.0, conf))
-
         conf *= length_scale
         return max(0.0, min(1.0, conf))
 
@@ -202,14 +188,24 @@ def decrypt_known(cipher_name: str, ciphertext: str, key: Optional[str]) -> str:
 
 def _score_from_result(r: SolveResult) -> float:
     """
-    Prefer plugin-provided score if present (e.g., periodic_substitution stores 'best_full').
-    Otherwise compute a generic score from plaintext.
+    Prefer plugin-provided, comparable scores if present.
+    Priority:
+      1) meta['report_fitness'] (fulltext plaintext_fitness; best for cross-cipher ranking)
+      2) meta['best_full'] (legacy hook; if you used this earlier)
+      3) fallback to rank_score(plaintext)
     """
-    if r.meta and isinstance(r.meta, dict) and "best_full" in r.meta:
-        try:
-            return float(r.meta["best_full"])
-        except (TypeError, ValueError):
-            pass
+    if r.meta and isinstance(r.meta, dict):
+        if "report_fitness" in r.meta:
+            try:
+                return float(r.meta["report_fitness"])
+            except (TypeError, ValueError):
+                pass
+        if "best_full" in r.meta:
+            try:
+                return float(r.meta["best_full"])
+            except (TypeError, ValueError):
+                pass
+
     return rank_score(r.plaintext)
 
 
@@ -217,7 +213,7 @@ def crack_unknown(ciphertext: str, *, top_n: int = 10, include: set[str] | None 
     """
     Ask registered plugins to attempt cracking.
     Rank results by:
-      - plugin-provided meta['best_full'] when available
+      - plugin-provided meta['report_fitness'] when available
       - otherwise rank_score(plaintext)
 
     If include is None (auto mode), prune obvious noise, but never prune to empty
@@ -260,14 +256,16 @@ def crack_unknown(ciphertext: str, *, top_n: int = 10, include: set[str] | None 
         )
 
     scored = _dedupe_by_plaintext(scored)
-    scored.sort(key=lambda x: x.score, reverse=True)
+
+    # If you added SolveResult(order=True) + sort_index, you can just sort directly:
+    scored.sort()
 
     # --- Optional: relative confidence adjustment (winner gap) ---
-    # NOTE: SolveResult is frozen, so we must rebuild objects instead of mutating fields.
+    # IMPORTANT: SolveResult is frozen -> use dataclasses.replace(), do NOT mutate in place.
     if scored and get_quadgram_scorer() is not None and len(scored) >= 2:
 
-        def avgq(r: SolveResult) -> float:
-            t = normalize_az(r.plaintext or "")
+        def avgq(res: SolveResult) -> float:
+            t = normalize_az(res.plaintext or "")
             q = max(1, len(t) - 3)
             return quadgram_score(t) / q
 
@@ -275,29 +273,15 @@ def crack_unknown(ciphertext: str, *, top_n: int = 10, include: set[str] | None 
         a1 = avgq(scored[1])
 
         gap = a0 - a1  # positive means winner better
-        if gap > 0.10:  # tune: 0.08–0.15 reasonable
-            boost = min(0.20, 0.8 * gap)  # cap boost
+        if gap > 0.10:
+            boost = min(0.20, 0.8 * gap)
 
-            adjusted: list[SolveResult] = []
-            for idx, r in enumerate(scored):
-                if idx == 0:
-                    new_conf = max(0.0, min(1.0, r.confidence + boost))
-                else:
-                    new_conf = max(0.0, min(1.0, r.confidence * (1.0 - 0.25 * boost)))
+            def clamp01(x: float) -> float:
+                return max(0.0, min(1.0, x))
 
-                adjusted.append(
-                    SolveResult(
-                        cipher_name=r.cipher_name,
-                        plaintext=r.plaintext,
-                        key=r.key,
-                        score=r.score,
-                        confidence=new_conf,
-                        notes=r.notes,
-                        meta=r.meta,
-                    )
-                )
-
-            scored = adjusted
+            scored[0] = replace(scored[0], confidence=clamp01(scored[0].confidence + boost))
+            for i in range(1, len(scored)):
+                scored[i] = replace(scored[i], confidence=clamp01(scored[i].confidence * (1.0 - 0.25 * boost)))
 
     # Auto-mode pruning AFTER confidence is computed, with length-adaptive thresholds
     if include is None and scored:
@@ -307,7 +291,10 @@ def crack_unknown(ciphertext: str, *, top_n: int = 10, include: set[str] | None 
         conf_cut = 0.01 if n_in < 180 else 0.05
         gib_cut = 0.92 if n_in < 180 else 0.85
 
-        pruned = [x for x in scored if x.confidence >= conf_cut and gibberish_probability(x.plaintext) <= gib_cut]
+        pruned = [
+            x for x in scored
+            if x.confidence >= conf_cut and gibberish_probability(x.plaintext) <= gib_cut
+        ]
 
         # Never prune to empty if we had candidates; just return best-ranked
         if pruned:
