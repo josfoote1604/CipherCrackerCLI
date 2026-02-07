@@ -80,15 +80,17 @@ class QuadgramScorer:
         return cls(logp=logp, floor=floor)
 
     def score(self, text: str) -> float:
-        s = normalize_az(text)
+        # Ensure we are scoring A-Z only (and uppercase)
+        s = "".join(ch for ch in text.upper() if "A" <= ch <= "Z")
         n = len(s)
         if n < 4:
-            return float("-inf")
+            return 0.0
 
         total = 0.0
-        # iterate over integer indices, not characters
-        for idx in range(n - 3):
-            g = s[idx:idx + 4]
+        # iterate over integer indices (not characters)
+        for i in range(n - 3):
+            g = s[i: i + 4]
             total += self.logp.get(g, self.floor)
         return total
+
 
