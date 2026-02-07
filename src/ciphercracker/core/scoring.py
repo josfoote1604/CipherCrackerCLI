@@ -73,8 +73,12 @@ def get_common_words() -> set[str]:
         return _COMMON_WORDS
 
     try:
-        # your file: ciphercracker/data/common_words_20k.txt
-        raw = resources.files("ciphercracker.data").joinpath("common_words_20k.txt").read_text(encoding="utf-8")
+        # Prefer the larger list if present, fallback to the 20k list.
+        base = resources.files("ciphercracker.data")
+        path = base.joinpath("common_words_extended.txt")
+        if not path.is_file():
+            path = base.joinpath("common_words_20k.txt")
+        raw = path.read_text(encoding="utf-8")
         words = set()
         for line in raw.splitlines():
             w = line.strip().upper()
@@ -89,7 +93,9 @@ def get_common_words() -> set[str]:
 
 
 #_WORD_RE = re.compile(r"[A-Z]{2,}")
-_WORD_RE = re.compile(r"[A-Z]+")
+#_WORD_RE = re.compile(r"[A-Z]+")
+_WORD_RE = re.compile(r"[A-Z]{3,}")
+
 
 def chi_squared_english(az_text: str) -> float:
     """Lower is better."""
@@ -110,8 +116,13 @@ def chi_squared_english(az_text: str) -> float:
 def _extract_words(text: str) -> list[str]:
     cleaned = normalize_keep_spaces(text).upper()
     words = _WORD_RE.findall(cleaned)
-    words = [w for w in words if len(w) >= 2 or w in ("A", "I")]
+    # Keep single-letter A/I as special cases
+    if " A " in f" {cleaned} ":
+        words.append("A")
+    if " I " in f" {cleaned} ":
+        words.append("I")
     return words
+
 
 
 def word_hit_rate(text: str) -> float:
@@ -119,8 +130,14 @@ def word_hit_rate(text: str) -> float:
     if not words:
         return 0.0
     common = get_common_words()
-    hits = sum(1 for w in words if w in common)
-    return hits / len(words)
+
+    def wlen(w: str) -> float:
+        return min(8.0, float(len(w)))  # cap
+
+    total_w = sum(wlen(w) for w in words)
+    hit_w = sum(wlen(w) for w in words if w in common)
+    return hit_w / total_w if total_w > 0 else 0.0
+
 
 def word_bonus(text: str) -> float:
     """
